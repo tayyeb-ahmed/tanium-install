@@ -1,1 +1,462 @@
 
+#!/usr/bin/python3 -u
+import os,sys,json,boto3,datetime,yaml
+
+clouformation_parameters = {
+    "Environment": {
+      "Description": "Name of the environment for the tag",
+      "Type": "String"
+    },
+    "QuickSightNamespace": {
+      "Default": "default",
+      "Description": "Namespace for the ARN",
+      "Type": "String"
+    },
+    "QuickSightPrincipalType": {
+      "Default": "user",
+      "Description": "Principal type for the ARN",
+      "Type": "String"
+    },
+    "QuickSightUsername": {
+      "Default": "master",
+      "Description": "Username with QuickSight permissions",
+      "Type": "String"
+    },
+    "DatabaseSchema": {
+      "Description": "The Glue database schema to use for queries",
+      "Type": "String"
+    },
+    "DataBucketName": {
+      "Description": "The name of the Global Config bucket",
+      "Type": "String"
+    },
+    "DataBucketKeyArn": {
+      "Description": "The ARN of the KMS key to the global config bucket",
+      "Type": "String"
+    }
+}
+
+cloudformation_resources = {
+    "QuickSightDataSourceAthenaRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "RoleName": {"Fn::Sub" : "sec-compliance-compliance-dashboard-data-source-role-${Environment}"},
+        "Description": "A role for the QuickSight data source to access Athena/S3",
+        "ManagedPolicyArns": [
+          "arn:aws:iam::aws:policy/service-role/AWSQuicksightAthenaAccess"
+        ],
+        "Policies": [{
+          "PolicyName": "AllowDataBucketAccess",
+          "PolicyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Action": [
+                        "s3:ListBucket",
+                        "s3:GetObject",
+                        "s3:GetObjectVersion"
+                    ],
+                    "Resource": [
+                        {"Fn::Sub" : "arn:aws:s3:::${DataBucketName}"},
+                        {"Fn::Sub" : "arn:aws:s3:::${DataBucketName}/*"}
+                    ],
+                    "Effect": "Allow"
+                },
+                {
+                    "Action": [
+                        "kms:Encrypt",
+                        "kms:Decrypt",
+                        "kms:ReEncrypt*",
+                        "kms:GenerateDataKey*",
+                        "kms:DescribeKey"
+                    ],
+                    "Resource": [
+                        { "Ref": "DataBucketKeyArn" }
+                    ],
+                    "Effect": "Allow"
+                }
+            ]}
+        }],
+        "AssumeRolePolicyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {
+                        "Service": "quicksight.amazonaws.com"
+                    },
+                    "Action": "sts:AssumeRole"
+                }
+            ]
+        }
+      }
+    },
+    "datasource": {
+          "DataSourceParameters": {
+            "AthenaParameters": {
+              "RoleArn": { "Fn::GetAtt" : [ "QuickSightDataSourceAthenaRole", "Arn" ] },
+              "WorkGroup": {
+               "Ref": "DataSourceAthenaWorkGroup01"
+              }
+            }
+          }
+    },
+    "dashboard": {
+        "Name": {
+            "Fn::Join": [
+              "",
+              [
+                {
+                  "Ref": "DashboardName"
+                },
+                " - ",
+                {
+                  "Ref": "Environment"
+                }
+              ]
+            ]
+          },
+          "LinkSharingConfiguration": {
+                "Permissions": [
+                  {
+                    "Actions": [
+                      "quicksight:DescribeDashboard",
+                      "quicksight:ListDashboardVersions",
+                      "quicksight:QueryDashboard"
+                    ],
+                    "Principal": {"Fn::Sub" : "arn:aws:quicksight:us-east-1:${AWS::AccountId}:namespace/default"}
+                  }
+                ]
+           }
+    }
+}
+
+#
+# Show Usage
+#
+def show_usage():
+    print("")
+    print("This program updates a QuickSight CloudFormation template containing a QuickSight Dashboard and DataSource with the contents of a Dashboard, DataSets, and DataSources from the specified dashboard ID.")
+    print("") 
+    print("Usage:")    
+    print("")
+    #print(f"     {sys.argv[0]}  <qs-cli-template-id>")    
+    print(f"     {sys.argv[0]}  <template-file> <dashboard-id>")
+    print("")
+    print("")
+
+#
+# Dump YAML file as json
+#
+def yaml_to_json(filename):
+    with open(filename, 'r') as file:
+        contents = yaml.from_yaml(file)
+        print(json.dumps(contents, json_file))
+
+#
+# Create a deployable template for production using the CDK-Generated CFN template
+#
+def generate_cloudformation_template(template_file_path):
+    # Load the template generated by qscli
+    with open(f"{template_file_path}") as yaml_file:
+        try:
+            generated_template = yaml.safe_load(yaml_file)
+        except yaml.YAMLError as e:
+            print(f"Error parsing YAML file {template_file_path}: {str(e)}")
+            sys.exit(1)
+    # Identify the required resources we want to change
+    template_dashboard_resource = None
+    template_dataset_resources = []
+    template_datasource_resources = []
+    for resource in generated_template['Resources']:
+        if generated_template['Resources'][resource]['Type'] == 'AWS::QuickSight::Dashboard':
+            template_dashboard_resource = resource
+        elif generated_template['Resources'][resource]['Type'] == 'AWS::QuickSight::DataSet':
+            template_dataset_resources.append(resource)
+        elif generated_template['Resources'][resource]['Type'] == 'AWS::QuickSight::DataSource':
+            template_datasource_resources.append(resource)
+    if template_dashboard_resource is None:
+        raise Exception(f"Could not find a resource in the generated template {template_file_path} with Type == 'AWS::QuickSight::Dashboard'")
+    # Make the customizations to the template
+    for parameter in clouformation_parameters:
+        generated_template['Parameters'][parameter] = clouformation_parameters[parameter]
+    generated_template['Resources']['QuickSightDataSourceAthenaRole'] = cloudformation_resources['QuickSightDataSourceAthenaRole']
+    generated_template['Resources'][template_dashboard_resource]['Properties']['Name'] = cloudformation_resources['dashboard']['Name']
+    generated_template['Resources'][template_dashboard_resource]['Properties']['LinkSharingConfiguration'] = cloudformation_resources['dashboard']['LinkSharingConfiguration'] 
+    for datasource in template_datasource_resources:
+        generated_template['Resources'][datasource]['Properties']['DataSourceParameters']['AthenaParameters']['RoleArn'] = cloudformation_resources['datasource']['DataSourceParameters']['AthenaParameters']['RoleArn']
+    for dataset in template_dataset_resources:
+        for map in generated_template['Resources'][dataset]['Properties']['PhysicalTableMap']:
+            if 'CustomSql' in generated_template['Resources'][dataset]['Properties']['PhysicalTableMap'][map]:
+                generated_template['Resources'][dataset]['Properties']['PhysicalTableMap'][map]['CustomSql']['SqlQuery'] = {
+                    "Fn::Sub" : 
+                    generated_template['Resources'][dataset]['Properties']['PhysicalTableMap'][map]['CustomSql']['SqlQuery'].replace("awsconfig.aws_config_configuration_snapshot", "${DatabaseSchema}")
+                }
+    for declaration in generated_template['Resources'][template_dashboard_resource]['Properties']['Definition']['DataSetIdentifierDeclarations']:
+            if 'awsconfigresourcecompliancedaily' in str(declaration):
+                declaration['Identifier'] = 'aws_config_resource_compliance_daily'
+    generated_template['Resources']['AWSConfigComplianceDashboard'] = generated_template['Resources'].pop('DevAWSConfigCompliance')
+    # Print the modified template
+    yaml.dump(generated_template, sys.stdout)
+
+#
+# Red a YAML file and print as JSON
+#
+def display_yaml_file_as_json(file_path):
+    breakpoint()
+    with open(f"{file_path}") as yaml_file:
+        try:
+            _json = yaml.safe_load(yaml_file)
+            print(json.dumps(_json, indent=2, default=str))
+        except yaml.YAMLError as e:
+            print(f"Error parsing YAML file {file_path}: {str(e)}")
+            sys.exit(1)
+
+def camel_case_string(name):
+    if '-' in name:
+        resource_id = name.split("-")
+        for index, token in enumerate(resource_id):
+            resource_id[index] = token.capitalize()
+        return "".join(resource_id)
+    elif name[0].islower():
+        return name.capitalize()
+    else:
+        return name
+
+#
+# Adjust a template for existing QuickSight resources without adding new DataSets.
+#
+#     template_file_path - The YAML template which contains the dashboard that was updated
+#     dashboard_id -       The ID of the dashboard within QuickSight which will be used to update the template with changes
+#
+def update_quicksight_template(template_file_path, dashboard_id):
+    account_id = boto3.client("sts").get_caller_identity()["Account"]
+    data_set_mappings: {
+        "ConfigCostsSummaryDataSet": "9593e206-027d-4ff6-9b0b-661b7862a1f5",
+        "AwsConfigHistoryDataSet": "2e219d84-6b17-4ec0-af5b-2c3ab560d686"
+    }
+    quicksight_api = boto3.client('quicksight')
+    dashboard_definition = quicksight_api.describe_dashboard_definition(AwsAccountId=account_id, DashboardId=dashboard_id)['Definition']
+    # Load the template generated by qscli
+    with open(f"{template_file_path}") as yaml_file:
+        try:
+            existing_template = yaml.safe_load(yaml_file)
+        except yaml.YAMLError as e:
+            print(f"Error parsing YAML file {template_file_path}: {str(e)}")
+            sys.exit(1)
+    if existing_template is None:
+        raise Exception(f"Could not load template at path: {template_file_path}")
+    new_template = {
+      "AWSTemplateFormatVersion": "2010-09-09",
+      "Description": f"",
+      "Parameters": dict(existing_template['Parameters']),
+      "Resources": {
+      }
+    }
+    dashboard_resource_key_name = None
+    datasource_resource_key_name = None
+    for resource in existing_template['Resources']:
+        if existing_template['Resources'][resource]['Type'] == 'AWS::QuickSight::Dashboard':
+            dashboard_resource_key_name = resource 
+        elif existing_template['Resources'][resource]['Type'] == 'AWS::QuickSight::DataSource':
+            datasource_resource_key_name = resource
+            new_template['Resources'][datasource_resource_key_name] = existing_template['Resources'][resource]
+        elif existing_template['Resources'][resource]['Type'] == 'AWS::IAM::Role':
+            new_template['Resources'][resource] = existing_template['Resources'][resource]
+
+    for dataset in dashboard_definition['DataSetIdentifierDeclarations']:
+        dataset['Definition'] = quicksight_api.describe_data_set(AwsAccountId=account_id, DataSetId=dataset['DataSetArn'].split('/')[1])['DataSet']
+        new_dataset_resource = {
+          "Type": "AWS::QuickSight::DataSet",
+          "Properties": {
+              "AwsAccountId": {
+                "Ref": "AWS::AccountId"
+              },
+              "DataSetId": {
+                "Fn::Join": [
+                  "",
+                  [
+                    dataset['Identifier'],
+                    "-",
+                    {
+                      "Ref": "Environment"
+                    }
+                  ]
+                ]
+              },
+              "DataSetUsageConfiguration": {
+                "DisableUseAsDirectQuerySource": False,
+                "DisableUseAsImportedSource": False
+              },
+              "ImportMode": "SPICE",
+              "Name": {
+                "Fn::Join": [
+                  "",
+                  [
+                    "aws-config-history",
+                    "-",
+                    {
+                      "Ref": "Environment"
+                    }
+                  ]
+                ]
+              },
+              "Permissions": [
+                {
+                  "Actions": [
+                    "quicksight:DeleteDataSet",
+                    "quicksight:UpdateDataSetPermissions",
+                    "quicksight:PutDataSetRefreshProperties",
+                    "quicksight:CreateRefreshSchedule",
+                    "quicksight:CancelIngestion",
+                    "quicksight:ListRefreshSchedules",
+                    "quicksight:UpdateRefreshSchedule",
+                    "quicksight:PassDataSet",
+                    "quicksight:DeleteRefreshSchedule",
+                    "quicksight:DescribeDataSetRefreshProperties",
+                    "quicksight:DescribeDataSet",
+                    "quicksight:CreateIngestion",
+                    "quicksight:DescribeRefreshSchedule",
+                    "quicksight:ListIngestions",
+                    "quicksight:UpdateDataSet",
+                    "quicksight:DescribeDataSetPermissions",
+                    "quicksight:DeleteDataSetRefreshProperties",
+                    "quicksight:DescribeIngestion"
+                  ],
+                  "Principal": {
+                    "Fn::Sub": [
+                      "arn:aws:quicksight:${aws_region}:${aws_account}:${principalType}/${qsNamespace}/${user}",
+                      {
+                        "aws_account": {
+                          "Ref": "AWS::AccountId"
+                        },
+                        "aws_region": {
+                          "Ref": "AWS::Region"
+                        },
+                        "principalType": {
+                          "Ref": "QuickSightPrincipalType"
+                        },
+                        "qsNamespace": {
+                          "Ref": "QuickSightNamespace"
+                        },
+                        "user": {
+                          "Ref": "DashboardOwner"
+                        }
+                      }
+                    ]
+                  }
+                }
+              ],
+              "LogicalTableMap": dataset['Definition']['LogicalTableMap'],
+              "PhysicalTableMap": dataset['Definition']['PhysicalTableMap']
+          }
+        }  
+        physical_table_map = new_dataset_resource['Properties']['PhysicalTableMap']
+        for map_key in physical_table_map:
+            for key in physical_table_map[map_key]:
+                if key == 'CustomSql':
+                    # Replace the data source with a Ref to the template DataSource
+                    physical_table_map[map_key][key]['DataSourceArn'] = {
+                        "Fn::GetAtt": [ datasource_resource_key_name, "Arn" ]
+                    }
+                    # Parameterize the database.table element of the any SQL queries
+                    sql_query = physical_table_map[map_key][key]['SqlQuery']
+                    schema_parameter_name = None
+                    # TODO Improve this primitive method for getting the schema label
+                    for p in new_template['Parameters']:
+                        if 'Schema' in p:
+                            schema_parameter_name = p
+                    tokenized_query = sql_query.replace('\r\n', ' ').split(' ')
+                    for index, token in enumerate(tokenized_query):
+                        if token.strip().upper() == 'FROM':
+                            tokenized_query[index + 1] = '${' + schema_parameter_name + '}'
+                    physical_table_map[map_key][key]['SqlQuery'] = {
+                            "Fn::Sub": " ".join(tokenized_query)
+                    }
+                else:
+                    raise Exception(f"No implementation exists for PhysicalTableMap element '{key}'.  Known types are ['CustomSql']")
+        #breakpoint()
+        dataset_resource_key_name = f"{camel_case_string(dataset['Definition']['Name'])}QuickSightDataSet"
+        dataset['DataSetArn'] = { "Fn::GetAtt": [dataset_resource_key_name, "Arn" ] }
+        dataset.pop('Definition')
+        new_template['Resources'][dataset_resource_key_name] = dict(new_dataset_resource)
+    #breakpoint()
+    new_template['Resources'][dashboard_resource_key_name] = dict(existing_template['Resources'][dashboard_resource_key_name])
+    new_template['Resources'][dashboard_resource_key_name]['Properties']['Definition'] = dashboard_definition
+    #breakpoint()
+    for sheet in dashboard_definition['Sheets']:
+        for control in sheet['ParameterControls']:
+            for key in control:
+                if key == 'DateTimePicker':
+                    if 'DisplayOptions' in control[key]:
+                        if 'DateIconVisibility' in control[key]['DisplayOptions']:
+                            control[key]['DisplayOptions'].pop('DateIconVisibility')
+                        if 'HelperTextVisibility' in control[key]['DisplayOptions']:
+                            control[key]['DisplayOptions'].pop('HelperTextVisibility')
+    #print(f"{json.dumps(new_template, indent=2, default=str)}")
+    yaml.dump(new_template, sys.stdout)
+
+#
+# Show details about a dashboard
+#
+def analyze_dashboard(dashboard_id):
+    account_id = boto3.client("sts").get_caller_identity()["Account"]
+    quicksight_api = boto3.client('quicksight')
+    dashboard = quicksight_api.describe_dashboard_definition(AwsAccountId=account_id, DashboardId=dashboard_id)
+    #breakpoint()
+    print(f"\n")
+    print(f"Display Name: {dashboard['Name']}")
+    print(f"Dashboard ID: {dashboard['DashboardId']}")
+    print(f"")
+    print(f"Sheets: ")
+    for sheet in dashboard['Definition']['Sheets']:
+        print(f"")
+        print(f"    SheetId:          {sheet['SheetId']}")
+        print(f"    Name:             {sheet['Name']}")
+    print(f"")
+    print(f"DataSets: ")
+    for dataset in dashboard['Definition']['DataSetIdentifierDeclarations']:
+        print(f"")
+        print(f"    Identifier:       {dataset['Identifier']}")
+        print(f"    DataSetArn:       {dataset['DataSetArn']}")
+        #breakpoint()
+        dataset_details = quicksight_api.describe_data_set(AwsAccountId=account_id, DataSetId=dataset['DataSetArn'].split('/')[1])['DataSet']
+        print(f"        DataSetId:        {dataset_details['DataSetId']}")
+        print(f"        Name:             {dataset_details['Name']}")
+        print(f"        Table Map Length: {len(dataset_details['LogicalTableMap'].keys())}/{len(dataset_details['PhysicalTableMap'].keys())}")
+        print(f"        Logical Table Map ({len(dataset_details['LogicalTableMap'].keys())} entries):")
+        for map_key in dataset_details['LogicalTableMap']:
+            print(f"")
+            print(f"             Table: {map_key}")
+            print(f"             Alias: {dataset_details['LogicalTableMap'][map_key]['Alias']}")
+            print(f"             Source: {str(dataset_details['LogicalTableMap'][map_key]['Source'])}")
+            #breakpoint()
+        print(f"")
+        print(f"        Physical Table Map ({len(dataset_details['PhysicalTableMap'].keys())} entries):")
+        for map_key in dataset_details['PhysicalTableMap']:
+            print(f"")
+            print(f"             Table: {map_key}")
+            map_details = dataset_details['PhysicalTableMap'][map_key]
+            #breakpoint()
+            indent='                                    '
+            if 'CustomSql' in map_details:
+                print(f"                 Type:         {next(iter(map_details))}")
+                print(f"                 DataSouceArn: {map_details['CustomSql']['DataSourceArn']}")
+                print(f"                 Name:         {map_details['CustomSql']['Name']}")
+                print(f"                 SqlQuery:     ")
+                print(indent + map_details['CustomSql']['SqlQuery'].replace('\n', '\n' + indent))
+                #breakpoint()
+    if True:
+        print(f"{json.dumps(dashboard, indent=2)}")
+    print(f"")
+
+if len(sys.argv) < 2:
+    show_usage()
+    sys.exit(1)
+
+#generate_cloudformation_template(sys.argv[1])
+#display_yaml_file_as_json(sys.argv[1])
+#yaml_to_json("/home/cloudshell-user/LZ-SBNA-Custom-Config/compliance-dashboard/cfn-sec-compliance-compliance-dashboard.yaml")
+#analyze_dashboard(sys.argv[1])
+update_quicksight_template(sys.argv[1], sys.argv[2])
+
